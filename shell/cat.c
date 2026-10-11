@@ -140,7 +140,7 @@ enum ProcessResult process_input(int fd, bool is_stdin, const struct stat* outpu
 int main(int argc, char* argv[]) {
     struct stat output;
     if (fstat(STDOUT_FILENO, &output) == -1) {
-        perror("fstat");;
+        perror("fstat");
         return 1;
     }
     if (argc == 1) {
