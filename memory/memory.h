@@ -10,6 +10,11 @@ void* my_realloc(void* ptr, size_t size);
 void* my_reallocf(void* ptr, size_t size);
 void* my_valloc(size_t size);
 
+void* my_memset(void* b, int c, size_t len);
+void* my_memcpy(void* dst, const void* src, size_t n);
+int my_memcmp(const void* s1, const void* s2, size_t n);
+void* my_memmove(void* dst, const void* src, size_t len);
+
 struct Header {
     size_t alignment_size;
     size_t allocated_size;
