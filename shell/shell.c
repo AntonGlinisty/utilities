@@ -8,7 +8,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-void write_error() {
+void write_error(void) {
     char error_message[30] = "An error has occurred\n";
     write(STDERR_FILENO, error_message, strlen(error_message)); 
 }
@@ -84,34 +84,37 @@ char** initialize_path(size_t* path_size) {
     return path;
 }
 
-char* separate_operators(const char* input, size_t* capacity) {
-    size_t len = strlen(input);
+char* separate_operators(char** line, size_t* linecap) {
+    size_t len = strlen(*line);
 
     if (len > (SIZE_MAX - 1) / 3) {
         return NULL;
     }
 
-    *capacity = 3 * len + 1;
-    char* result = malloc(*capacity);
+    *linecap = 3 * len + 1;
+    char* result = malloc(*linecap);
     if (result == NULL) {
         return NULL;
     }
 
     size_t out = 0;
     for (size_t i = 0; i < len; i++) {
-        if (input[i] == '>' || input[i] == '<') {
+        if ((*line)[i] == '>' || (*line)[i] == '<' || (*line)[i] == '&') {
             result[out++] = ' ';
-            result[out++] = input[i];
+            result[out++] = (*line)[i];
 
-            if (input[i] == '>' && i < len - 1 && input[i + 1] == '>') {
-                result[out++] = input[++i];
+            if ((*line)[i] == '>' && i < len - 1 && (*line)[i + 1] == '>') {
+                result[out++] = (*line)[++i];
             }
 
             result[out++] = ' ';
         } else {
-            result[out++] = input[i];
+            result[out++] = (*line)[i];
         }
     }
+
+    free(*line);
+    *line = NULL;
 
     result[out] = '\0';
     return result;
@@ -232,21 +235,17 @@ bool is_redirection(const char* arg) {
     return strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0 || strcmp(arg, "<") == 0;
 }
 
-bool validate_input(char*** argv, size_t* argc) {
-    if (*argc == 0 || is_redirection((*argv)[0])) {
-        write_error();
-        free_argv(argv, argc);
+bool validate_segment(char** argv, size_t start, size_t end) {
+    if (start == end || is_redirection(argv[start])) {
         return false;
     }
 
-    for (size_t i = 1; i < *argc; i++) {
-        if (!is_redirection((*argv)[i])) {
+    for (size_t i = start + 1; i < end; i++) {
+        if (!is_redirection(argv[i])) {
             continue;
         }
 
-        if (i + 1 == *argc || is_redirection((*argv)[i + 1])) {
-            write_error();
-            free_argv(argv, argc);
+        if (i + 1 == end || is_redirection(argv[i + 1])) {
             return false;
         }
 
@@ -264,7 +263,6 @@ char* get_command_full_path(char** path, size_t path_size, char*** argv, size_t*
 
         char* command_full_path = malloc(strlen(candidate) + strlen(command) + 2);
         if (command_full_path == NULL) {
-            write_error();
             free_argv(argv, argc);
             return NULL;
         }
@@ -280,7 +278,6 @@ char* get_command_full_path(char** path, size_t path_size, char*** argv, size_t*
         return command_full_path;
     }
 
-    write_error();
     free_argv(argv, argc);
     return NULL;
 }
@@ -321,7 +318,13 @@ bool process_redirections(char** argv, size_t argc) {
     return true;
 }
 
-void process_child(char** argv, size_t argc, char* command_full_path) {
+void process_child(char** path, size_t path_size, char** argv, size_t argc) {
+    char* command_full_path = get_command_full_path(path, path_size, &argv, &argc);
+    if (command_full_path == NULL) {
+        write_error();
+        exit(1);
+    }
+
     if (!process_redirections(argv, argc)) {
         write_error();
         exit(1);
@@ -334,10 +337,7 @@ void process_child(char** argv, size_t argc, char* command_full_path) {
     exit(0);
 }
 
-bool process_parent(pid_t pid, char***argv, size_t* argc, char** command_full_path) {
-    free_argv(argv, argc);
-    free_command_full_path(command_full_path);
-
+bool wait_child(pid_t pid) {
     while (true) {
         pid_t waitpid_result = waitpid(pid, NULL, 0);
         if (waitpid_result == -1 && errno == EINTR) {
@@ -348,7 +348,75 @@ bool process_parent(pid_t pid, char***argv, size_t* argc, char** command_full_pa
         }
         break;
     }
+
     return true;
+}
+
+pid_t spawn_child(char** path, size_t path_size, char** argv, size_t command_start, size_t command_end) {
+    char** command_argv = calloc(command_end - command_start + 1, sizeof(char*));
+    if (command_argv == NULL) {
+        return -1;
+    }
+
+    for (size_t j = 0; j < command_end - command_start; j++) {
+        command_argv[j] = argv[command_start + j];
+    }
+    command_argv[command_end - command_start] = NULL;
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        free(command_argv);
+        return -1;
+    }
+    if (pid == 0) {
+        process_child(path, path_size, command_argv, command_end - command_start);
+    }
+
+    free(command_argv);
+    return pid;
+}
+
+bool process_commands_execution(char** path, size_t path_size, char*** argv, size_t* argc) {
+    pid_t* pids_storage = calloc(*argc + 1, sizeof(pid_t));
+    if (pids_storage == NULL) {
+        return false;
+    }
+
+    bool has_errors = false;
+    size_t command_start = 0;
+    size_t childs_count = 0;
+
+    for (size_t i = 0; i <= *argc; i++) {
+        if (i != *argc && strcmp((*argv)[i], "&") != 0) {
+            continue;
+        }
+
+        if (command_start < i) {
+            if (!validate_segment(*argv, command_start, i)) {
+                write_error();
+            } else {
+                pid_t pid = spawn_child(path, path_size, *argv, command_start, i);
+
+                if (pid == -1) {
+                    has_errors = true;
+                    break;
+                }
+                pids_storage[childs_count++] = pid;
+            }
+        }
+
+        command_start = i + 1;
+    }
+
+    for (size_t i = 0; i < childs_count; i++) {
+        if (!wait_child(pids_storage[i])) {
+            has_errors = true;
+        }
+    }
+
+    free(pids_storage);
+    free_argv(argv, argc);
+    return !has_errors;
 }
 
 bool process_commands(FILE* stream) {
@@ -358,11 +426,7 @@ bool process_commands(FILE* stream) {
 
     size_t path_size = 0;
     char** path = initialize_path(&path_size);
-    if (path == NULL) {
-        return false;
-    }
-
-    char* command_full_path = NULL;
+    if (path == NULL) { return false; }
 
     size_t argc = 0;
     char** argv = NULL;
@@ -379,10 +443,8 @@ bool process_commands(FILE* stream) {
         }
         line[linelen - 1] == '\n' ? line[linelen - 1] = '\0' : true;
 
-        char* new_line = separate_operators(line, &linecap);
+        char* new_line = separate_operators(&line, &linecap);
         if (new_line == NULL) { break; }
-        
-        free(line);
         line = new_line;
 
         bool is_empty_line = false;
@@ -394,21 +456,12 @@ bool process_commands(FILE* stream) {
         if (result == STOP_PROCESSING) { break; }
         if (result == SKIP_PROCESSING) { continue; }
 
-        if (!validate_input(&argv, &argc)) { continue; }
-
-        if ((command_full_path = get_command_full_path(path, path_size, &argv, &argc)) == NULL) { continue; }
-        
-        pid_t pid = fork();
-        if (pid == -1) { break; }
-        if (pid == 0) { process_child(argv, argc, command_full_path); }
-        
-        if (!process_parent(pid, &argv, &argc, &command_full_path)) { break; }
+        if (!process_commands_execution(path, path_size, &argv, &argc)) { break; }
     }
 
     free(line);
     free_path(&path, &path_size);
-    free(argv);
-    free(command_full_path);
+    free_argv(&argv, &argc);
 
     if (has_errors) {
         write_error();
