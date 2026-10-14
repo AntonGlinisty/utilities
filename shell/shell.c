@@ -63,7 +63,6 @@ bool write_data(int fd, const char* buffer, size_t size) {
     return true;
 }
 
-
 char** initialize_path(size_t* path_size) {
     char** path = malloc(sizeof(char*));
     if (path == NULL) {
@@ -161,40 +160,25 @@ char** parse_input(char* line, size_t* argc, bool* is_empty_line) {
     return argv;
 }
 
-enum ProcessInputResult {
-    SKIP_PROCESSING,
-    STOP_PROCESSING,
-    CONTINUE_PROCESSING
-};
-
-enum ProcessInputResult process_exit(char*** argv, size_t* argc) {    
-    if (*argc != 1) {
-        write_error();
-        free_argv(argv, argc);
-        return SKIP_PROCESSING;
-    }
-    exit(0);
-}
-
-enum ProcessInputResult process_cd(char*** argv, size_t* argc) {
+bool process_cd(char*** argv, size_t* argc) {
     if (*argc != 2 || chdir((*argv)[1]) == -1) {
         write_error();
     }
     free_argv(argv, argc);
-    return SKIP_PROCESSING;
+    return true;
 }
 
-enum ProcessInputResult process_path(char*** path, size_t* path_size, char*** argv, size_t* argc) {
+bool process_path(char*** path, size_t* path_size, char*** argv, size_t* argc) {
     if (*argc == 1) {
         free_path(path, path_size);
         free_argv(argv, argc);
-        return SKIP_PROCESSING;
+        return true;
     }
 
     size_t new_path_size = *argc - 1;
     char** new_path = calloc(new_path_size, sizeof(char*));
     if (new_path == NULL) {
-        return STOP_PROCESSING;
+        return false;
     }
 
     size_t index = 0;
@@ -202,7 +186,7 @@ enum ProcessInputResult process_path(char*** path, size_t* path_size, char*** ar
         *(new_path + index) = strdup((*argv)[index + 1]);
         if (*(new_path + index) == NULL) {
             free_path(&new_path,  &new_path_size);
-            return STOP_PROCESSING;
+            return false;
         }
     }
 
@@ -212,23 +196,7 @@ enum ProcessInputResult process_path(char*** path, size_t* path_size, char*** ar
     *path_size = new_path_size;
     *path = new_path;
 
-    return SKIP_PROCESSING;
-}
-
-enum ProcessInputResult process_input(char*** path, size_t* path_size, char*** argv, size_t* argc) {
-    if (strcmp((*argv)[0], "exit") == 0) {
-        return process_exit(argv, argc);
-    }
-
-    if (strcmp((*argv)[0], "cd") == 0) {
-        return process_cd(argv, argc);
-    }
-
-    if (strcmp((*argv)[0], "path") == 0) {
-        return process_path(path, path_size, argv, argc);
-    }
-
-    return CONTINUE_PROCESSING;
+    return true;
 }
 
 bool is_redirection(const char* arg) {
@@ -376,13 +344,14 @@ pid_t spawn_child(char** path, size_t path_size, char** argv, size_t command_sta
     return pid;
 }
 
-bool process_commands_execution(char** path, size_t path_size, char*** argv, size_t* argc) {
+bool process_commands_execution(char*** path, size_t* path_size, char*** argv, size_t* argc) {
     pid_t* pids_storage = calloc(*argc + 1, sizeof(pid_t));
     if (pids_storage == NULL) {
         return false;
     }
 
     bool has_errors = false;
+    bool exit_requested = false;
     size_t command_start = 0;
     size_t childs_count = 0;
 
@@ -395,13 +364,40 @@ bool process_commands_execution(char** path, size_t path_size, char*** argv, siz
             if (!validate_segment(*argv, command_start, i)) {
                 write_error();
             } else {
-                pid_t pid = spawn_child(path, path_size, *argv, command_start, i);
+                size_t segment_argc = i - command_start;
+                char* command = (*argv)[command_start];
 
-                if (pid == -1) {
-                    has_errors = true;
-                    break;
+                if (strcmp(command, "exit") == 0) {
+                    if (segment_argc != 1) {
+                        write_error();
+                    } else {
+                        exit_requested = true;
+                    }
+                } else if (strcmp(command, "cd") == 0 || strcmp(command, "path") == 0) {
+                    char** segment_argv = calloc(segment_argc + 1, sizeof(char*));
+                    if (segment_argv == NULL) {
+                        has_errors = true;
+                        break;
+                    }
+
+                    for (size_t j = 0; j < segment_argc; j++) {
+                        segment_argv[j] = (*argv)[command_start + j];
+                    }
+
+                    bool result = strcmp(command, "cd") == 0 ? process_cd(argv, argc) : process_path(path, path_size, argv, argc);
+                    if (!result) {
+                        free_argv(&segment_argv, &segment_argc);
+                        has_errors = true;
+                        break;
+                    }
+                } else {
+                    pid_t pid = spawn_child(*path, *path_size, *argv, command_start, i);
+                    if (pid == -1) {
+                        has_errors = true;
+                        break;
+                    }
+                    pids_storage[childs_count++] = pid;
                 }
-                pids_storage[childs_count++] = pid;
             }
         }
 
@@ -416,6 +412,10 @@ bool process_commands_execution(char** path, size_t path_size, char*** argv, siz
 
     free(pids_storage);
     free_argv(argv, argc);
+
+    if (exit_requested && !has_errors) {
+        exit(0);
+    }
     return !has_errors;
 }
 
@@ -426,14 +426,18 @@ bool process_commands(FILE* stream) {
 
     size_t path_size = 0;
     char** path = initialize_path(&path_size);
-    if (path == NULL) { return false; }
+    if (path == NULL) {
+        return false;
+    }
 
     size_t argc = 0;
     char** argv = NULL;
 
     bool has_errors = true;
     while (true) {
-        if (stream == stdin && !write_data(STDOUT_FILENO, "shell> ", strlen("shell> "))) { break; }
+        if (stream == stdin && !write_data(STDOUT_FILENO, "shell> ", strlen("shell> "))) {
+            break;
+        }
         
         if ((linelen = getline(&line, &linecap, stream)) == -1) {
             if (feof(stream)) {
@@ -444,19 +448,23 @@ bool process_commands(FILE* stream) {
         line[linelen - 1] == '\n' ? line[linelen - 1] = '\0' : true;
 
         char* new_line = separate_operators(&line, &linecap);
-        if (new_line == NULL) { break; }
+        if (new_line == NULL) {
+            break;
+        }
         line = new_line;
 
         bool is_empty_line = false;
         argv = parse_input(line, &argc, &is_empty_line);
-        if (is_empty_line) { continue; }
-        if (argv == NULL) { break; }
+        if (is_empty_line) {
+            continue;
+        }
+        if (argv == NULL) {
+            break;
+        }
 
-        enum ProcessInputResult result = process_input(&path, &path_size, &argv, &argc);
-        if (result == STOP_PROCESSING) { break; }
-        if (result == SKIP_PROCESSING) { continue; }
-
-        if (!process_commands_execution(path, path_size, &argv, &argc)) { break; }
+        if (!process_commands_execution(&path, &path_size, &argv, &argc)) {
+            break;
+        }
     }
 
     free(line);
